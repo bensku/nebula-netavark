@@ -1,0 +1,13 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+
+version: '3'
+
+tasks:
+  build:
+    desc: Builds binaries for current OS and arch
+    vars:
+      COMMIT:
+        sh: git rev-parse --short HEAD
+    cmds:
+      - go build -ldflags "-X github.com/bensku/nebula-netavark/network.Build={{.COMMIT}}" ./cmd/nebula-netavarkd
+      - go build ./cmd/nebula-netavark-plugin
