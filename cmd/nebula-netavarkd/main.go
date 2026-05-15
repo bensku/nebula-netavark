@@ -85,7 +85,7 @@ func main() {
 		msg := proto.PluginMessage{}
 		if err := json.NewDecoder(io.LimitReader(conn, 5*1024*1024)).Decode(&msg); err != nil {
 			slog.Warn("failed to parse netavark payload")
-			replyError(conn, err.Error())
+			replyError(conn, err.Error(), "")
 			_ = conn.Close()
 			continue
 		}
@@ -100,13 +100,13 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 	defer conn.Close()
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Error("panic in handleMessage", "recover", r)
-			replyError(conn, "panic in handleMessage, see logs")
+			slog.Error("recovered from panic", "recover", r)
+			replyError(conn, "panic in handleMessage, see logs", "")
 		}
 	}()
 
 	if len(msg.Args) < 2 {
-		replyError(conn, "internal error: too few arguments")
+		replyError(conn, "internal error: too few arguments", "")
 		return
 	}
 
@@ -117,20 +117,20 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 		conn.Write(msg.Raw)
 	case "setup":
 		if len(msg.Args) < 3 {
-			replyError(conn, "internal error: too few arguments")
+			replyError(conn, "internal error: too few arguments", "")
 			return
 		}
 		netns := msg.Args[2]
 		req := proto.NetworkPluginExec{}
 		err := json.Unmarshal(msg.Raw, &req)
 		if err != nil {
-			replyError(conn, err.Error())
+			replyError(conn, err.Error(), "")
 			return
 		}
 
 		// Connect endpoint to given netns and track it in case we need to restart
 		if err := netmgr.Up(req.ContainerName, netns); err != nil {
-			replyError(conn, err.Error())
+			replyError(conn, err.Error(), req.ContainerName)
 			return
 		}
 
@@ -148,13 +148,13 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 		req := proto.NetworkPluginExec{}
 		err := json.Unmarshal(msg.Raw, &req)
 		if err != nil {
-			replyError(conn, err.Error())
+			replyError(conn, err.Error(), "")
 			return
 		}
 
 		// Disconnect endpoint and clear it from our DB
 		if err := netmgr.Down(req.ContainerName); err != nil {
-			replyError(conn, err.Error())
+			replyError(conn, err.Error(), req.ContainerName)
 			return
 		}
 		reply(conn, struct{}{})
@@ -164,11 +164,15 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 			APIVersion: proto.APIVersion,
 		})
 	default:
-		replyError(conn, "unknown command "+cmd)
+		replyError(conn, "unknown command "+cmd, "")
 	}
 }
 
-func replyError(conn net.Conn, msg string) {
+func replyError(conn net.Conn, msg string, container string) {
+	if container == "" {
+		container = "unknown"
+	}
+	slog.Error(msg, "container", container)
 	reply(conn, proto.Error{Error: msg})
 }
 
