@@ -58,6 +58,8 @@ func main() {
 	}
 	defer lis.Close()
 
+	go func() { <-ctx.Done(); lis.Close() }()
+
 	// Start net manager
 	netmgr, err := network.LoadManager(*configPath, *statePath)
 	if err != nil {
@@ -89,8 +91,6 @@ func main() {
 		}
 
 		go handleMessage(netmgr, conn, msg)
-
-		go func() { <-ctx.Done(); lis.Close() }()
 	}
 
 }
