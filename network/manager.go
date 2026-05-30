@@ -51,7 +51,7 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 
 // Brings an endpoint up for given container netns
 func (mgr *Manager) Up(container string, netns string) error {
-	cfg := filepath.Join(mgr.configDir, container)
+	cfg := filepath.Join(mgr.configDir, container+".yml")
 	if _, err := os.Stat(cfg); err != nil {
 		return fmt.Errorf("could not load config %s: %w", cfg, err)
 	}
