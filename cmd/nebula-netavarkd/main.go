@@ -50,6 +50,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Ignore SIGHUP so it doesn't terminate us (default Go behavior)
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			// Do nothing
+		}
+	}()
+
 	var lc net.ListenConfig
 	lis, err := lc.Listen(ctx, "unix", *socketPath)
 	if err != nil {
