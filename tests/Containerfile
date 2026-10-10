@@ -1,0 +1,4 @@
+FROM docker.io/library/alpine:3.22
+
+# Alpine's default BusyBox omits httpd; the extras package supplies it.
+RUN apk add --no-cache busybox-extras

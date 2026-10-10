@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
-	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -138,21 +137,13 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 		}
 
 		// Connect endpoint to given netns and track it in case we need to restart
-		if err := netmgr.Up(req.ContainerName, netns); err != nil {
+		endpoint, err := netmgr.Up(req.ContainerName, netns)
+		if err != nil {
 			replyError(conn, err.Error(), req.ContainerName)
 			return
 		}
 
-		reply(conn, proto.StatusBlock{
-			// TODO fetch these from Nebula config somehow
-			// Neither netavark or Podman care, but these show up in e.g. podman inspect
-			Interfaces: map[string]proto.NetInterface{
-				"footun": {
-					MACAddress: "02:a2:b3:c4:d5:e6",
-					Subnets:    []proto.NetAddress{{IPNet: netip.MustParsePrefix("1.2.3.4/32")}},
-				},
-			},
-		})
+		reply(conn, endpointStatus(endpoint))
 	case "teardown":
 		req := proto.NetworkPluginExec{}
 		err := json.Unmarshal(msg.Raw, &req)
@@ -166,7 +157,6 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 			replyError(conn, err.Error(), req.ContainerName)
 			return
 		}
-		reply(conn, struct{}{})
 	case "info":
 		reply(conn, proto.Info{
 			Version:    network.Build,
@@ -174,6 +164,18 @@ func handleMessage(netmgr *network.Manager, conn net.Conn, msg proto.PluginMessa
 		})
 	default:
 		replyError(conn, "unknown command "+cmd, "")
+	}
+}
+
+func endpointStatus(endpoint network.EndpointInfo) proto.StatusBlock {
+	addresses := make([]proto.NetAddress, len(endpoint.Addresses))
+	for i, prefix := range endpoint.Addresses {
+		addresses[i] = proto.NetAddress{IPNet: prefix}
+	}
+	return proto.StatusBlock{
+		Interfaces: map[string]proto.NetInterface{
+			endpoint.InterfaceName: {Subnets: addresses},
+		},
 	}
 }
 

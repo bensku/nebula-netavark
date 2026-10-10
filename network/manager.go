@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +19,13 @@ type Manager struct {
 	db        endpointDb
 
 	endpoints sync.Map
+}
+
+// EndpointInfo describes the interface and addresses actually assigned by Nebula.
+// This information is needed by podman inspect
+type EndpointInfo struct {
+	InterfaceName string
+	Addresses     []netip.Prefix
 }
 
 // Loads manager
@@ -41,7 +49,7 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 		return nil, err
 	}
 	for container, netns := range endpoints {
-		if err := mgr.Up(container, netns); err != nil {
+		if _, err := mgr.Up(container, netns); err != nil {
 			slog.Warn("failed to reconnect endpoint, maybe container no longer exists", "container", container, "error", err)
 			_ = mgr.db.Remove(container) // Try to remove it from DB to prevent this error from reoccurring
 		}
@@ -50,23 +58,23 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 }
 
 // Brings an endpoint up for given container netns
-func (mgr *Manager) Up(container string, netns string) error {
+func (mgr *Manager) Up(container string, netns string) (EndpointInfo, error) {
 	cfg := filepath.Join(mgr.configDir, container+".yml")
 	if _, err := os.Stat(cfg); err != nil {
-		return fmt.Errorf("could not load config %s: %w", cfg, err)
+		return EndpointInfo{}, fmt.Errorf("could not load config %s: %w", cfg, err)
 	}
 
 	// Double-call protection
 	_, loaded := mgr.endpoints.LoadOrStore(container, "marker")
 	if loaded {
-		return fmt.Errorf("endpoint already exists")
+		return EndpointInfo{}, fmt.Errorf("endpoint already exists")
 	}
 
 	// Start up Nebula endpoint
 	ctrl, err := mgr.tunnels.start(cfg, netns)
 	if err != nil {
 		mgr.endpoints.Delete(container) // Clear our marker
-		return err
+		return EndpointInfo{}, err
 	}
 	mgr.endpoints.Store(container, ctrl) // Replace marker with real ctrl
 
@@ -76,10 +84,14 @@ func (mgr *Manager) Up(container string, netns string) error {
 	if err := mgr.db.Add(container, netns); err != nil {
 		ctrl.Stop() // It already started, ensure it stops (async) to avoid leaking resources
 		mgr.endpoints.Delete(container)
-		return err
+		return EndpointInfo{}, err
 	}
 
-	return nil
+	device := ctrl.Device()
+	return EndpointInfo{
+		InterfaceName: device.Name(),
+		Addresses:     append([]netip.Prefix(nil), device.Networks()...),
+	}, nil
 }
 
 // Takes an endpoint down for given container, if it was up

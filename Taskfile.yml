@@ -11,3 +11,14 @@ tasks:
     cmds:
       - go build -ldflags "-X github.com/bensku/nebula-netavark/network.Build={{.COMMIT}}" ./cmd/nebula-netavarkd
       - go build ./cmd/nebula-netavark-plugin
+
+  test:
+    desc: Runs unprivileged Go regression tests
+    cmds:
+      - go test ./...
+
+  test:e2e:
+    desc: Builds binaries and runs IPv6 end-to-end tests with rootful Podman
+    deps: [build]
+    cmds:
+      - sudo bash tests/e2e.sh {{.CLI_ARGS}}
