@@ -1,0 +1,14 @@
+[Unit]
+Description=nebula-netavark daemon
+# Try to get back up even if we crash repeatedly
+# It is BAD if Nebula networking is down, probably containers won't work at all
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/nebula-netavarkd
+Restart=always
+RestartSec=5s
+Type=notify
+
+[Install]
+WantedBy=multi-user.target

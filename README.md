@@ -1,84 +1,97 @@
 # nebula-netavark
 [Nebula](https://github.com/slackhq/nebula) overlay networks for Podman.
-Usage instructions TBD!
 
-## Shared endpoint configuration
+## Installation
+Install the binaries:
+* `nebula-netavarkd` to `/usr/bin` (or wherever you want to, just edit the systemd unit)
+* `nebula-netavark-plugin` to `/usr/lib/netavark/nebula` (Podman will find it there)
 
-The daemon loads `<container-name>.yml` from its `--config` directory
-(default: `/etc/containers/nebula`). An endpoint file can import a shared baseline
-and override only the values that differ for that container.
+Next, install the [nebula-netavarkd.service](./systemd/nebula-netavarkd.service) to
+`/etc/systemd/system` and enable it:
+```sh
+systemctl enable --now nebula-netavarkd
+systemctl status nebula-netavarkd
+```
+The service should not, without any configuration, do anything.
 
-For example, `network.yml` can contain:
+For container networking, you'll need to create Podman network with driver `nebula`.
+For clarity, it is best if the network's name is also `nebula`, though this is not required.
+Creating a network can be done with e.g. a quadlet network unit,
+see [nebula.network](./systemd/nebula.network).
 
-```yaml
+## Usage
+One container can currently have at most one Nebula endpoint. The endpoint
+configuration is located using the container's name.
+
+Put the Nebula configuration in `/etc/containers/nebula/${CONTAINER_NAME}.yml`.
+Format is same as as Nebula's [config.yml](https://github.com/slackhq/nebula/blob/master/examples/config.yml),
+with a few additions outlined below.
+Once the configuration is in place, simply start the container with
+`--network=nebula` and its network namespace should receive Nebula TUN device.
+
+Note that by default, Nebula will not grant your containers Internet access. If
+you want that, you can also join them in Podman bridge (or, if you're feeling
+adventurous and have publicly routable IPs, unsafe route straight to Internet).
+
+Unlike vanilla Nebula, **nebula-netavarkd automatically reloads configurations**.
+No need to send SIGHUP. You might want to keep key material embedded in
+configurations, because changes to those will not trigger reloads.
+
+### Host endpoint
+To enable Nebula connectivity on host, create `/etc/containers/nebula/_host.yml`.
+This gets you a normal Nebula endpoint on host, so that you need not to run
+vanilla Nebula at all.
+
+Also, you'll be able to use below additional features!
+
+## nebula-netavark additions
+We support some custom things in config.
+
+### Imports
+Config files can import each other. This may be useful if you have many
+containers in same network:
+
+First, define what you want to import:
+```sh
+# /etc/containers/nebula/networks/prod.yml
 pki:
   ca: /etc/nebula/ca.crt
-lighthouse:
-  hosts: [192.168.100.1]
-static_host_map:
-  "192.168.100.1": ["203.0.113.10:4242"]
-listen:
-  host: 0.0.0.0
-  port: 0
-firewall:
-  inbound:
-    - {port: any, proto: any, host: any}
-  outbound:
-    - {port: any, proto: any, host: any}
+# lighthouses, etc.
 ```
 
-Then `my-container.yml` only needs:
-
-```yaml
-import: network.yml
+```sh
+import: networks/prod.yml
 pki:
   cert: /etc/nebula/my-container.crt
   key: /etc/nebula/my-container.key
+# ... rest of endpoint configuration
 ```
 
-`import` accepts a path or a list, such as `import: [network.yml, sites/hel.yml]`.
-Import paths are always relative to the config directory, even in files that
-are themselves in a subdirectory. They must stay inside it; absolute paths and
-`..` are rejected. Imported files can import other files, up to 8 levels deep.
-Imports are applied in list order, with later imports overriding earlier ones,
-and the importing file's own settings overriding all imports. Missing files,
-malformed YAML, invalid import values and cycles fail endpoint startup.
+Or perhaps you might find this useful for e.g. shared firewall rules.
+It just merges files!
 
-Nested maps merge recursively. Scalars and lists replace baseline values;
-lists are **not appended**, including firewall rules. Explicit `false`, `0`,
-`[]`, and `null` override baseline values too. An empty map preserves inherited
-map entries; use `null` to clear a whole inherited section. The `import` key is
-removed before Nebula receives the settings. Paths in Nebula settings, such as
-`pki.cert`, retain Nebula's existing path behavior.
+## Unsafe addresses
+If you're using `unsafe_routes` for virtual IPs, nebula-netavarkd can create
+them for you:
 
-### Reloading
+```yaml
+# backend-1.yml and backend-2.yml
+import: network.yml
+unsafe_addresses: ["fd42:7669::1"]
+```
 
-The daemon watches the config directory and its subdirectories. After any file
-in them changes, every endpoint's config is loaded again, and endpoints whose
-effective config changed are reloaded. If an edit leaves a config invalid, the
-error is logged and the endpoint keeps running with its previous config until
-the file is fixed.
-
-Symlinked subdirectories are not supported, and changes to symlink targets
-outside the config directory are not detected.
-
-## Host endpoint
-
-If `_host.yml` exists in the config directory, the daemon also runs Nebula for
-the host itself, with its interface in the host network namespace. This can
-replace a separate Nebula service. Container names can't start with an
-underscore, so this can't clash with container configs.
-
-`_host.yml` supports imports and reloading like any other config. Every endpoint
-shares the host's UDP stack, so give the host endpoint its own `listen.port`
-(e.g. 4242) and keep containers on `port: 0`.
-
-If the host endpoint fails to start, the error is logged and containers keep
-working; startup is retried when config changes. Removing `_host.yml` does not
-stop a running host endpoint; restart the daemon for that.
-
-Note that restarting or upgrading the daemon also briefly takes down the host's
-Nebula connection, not just containers'.
+```yaml
+# On clients
+tun:
+  unsafe_routes:
+    - route: fd42:7669::1/128
+      install: true
+      via:
+        - gateway: "fd42:6e62::3" # backend-1, primary
+          weight: 1000000
+        - gateway: "fd42:6e62::5" # backend-2, backup
+          weight: 1
+```
 
 ## Testing
 Run unit/regression tests with:

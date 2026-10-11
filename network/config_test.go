@@ -2,6 +2,7 @@ package network
 
 import (
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -25,7 +26,7 @@ func writeConfig(t *testing.T, dir, name, contents string) string {
 
 func load(t *testing.T, dir, name string) (*config.C, error) {
 	t.Helper()
-	c, _, err := loadConfig(dir, name, slog.Default())
+	c, _, _, err := loadConfig(dir, name, slog.Default())
 	return c, err
 }
 
@@ -177,15 +178,62 @@ func TestConfigRawDetectsChanges(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "base.yml", "listen: {port: 1}\n")
 	writeConfig(t, dir, "endpoint.yml", "import: base.yml\n")
-	_, before, err := loadConfig(dir, "endpoint.yml", slog.Default())
+	_, before, _, err := loadConfig(dir, "endpoint.yml", slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	writeConfig(t, dir, "base.yml", "# Only a comment changed\nlisten:   {port: 1}\n")
-	_, same, _ := loadConfig(dir, "endpoint.yml", slog.Default())
+	_, same, _, _ := loadConfig(dir, "endpoint.yml", slog.Default())
 	writeConfig(t, dir, "base.yml", "listen: {port: 2}\n")
-	_, changed, _ := loadConfig(dir, "endpoint.yml", slog.Default())
+	_, changed, _, _ := loadConfig(dir, "endpoint.yml", slog.Default())
 	if before != same || before == changed {
 		t.Fatalf("raw configs: before %q, cosmetic edit %q, real edit %q", before, same, changed)
+	}
+}
+
+func TestUnsafeAddresses(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "network.yml", "unsafe_addresses: [\"fd42:7669::1\"]\nlisten: {port: 1}\n")
+	writeConfig(t, dir, "inherit.yml", "import: network.yml\n")
+	writeConfig(t, dir, "override.yml", `
+import: network.yml
+unsafe_addresses: ["fd42:7669::2/128", "10.99.0.1", "10.99.0.2/32", "::ffff:10.99.0.3", "FD42:7669::2"]
+`)
+	writeConfig(t, dir, "clear.yml", "import: network.yml\nunsafe_addresses: null\n")
+	for name, want := range map[string][]netip.Prefix{
+		"inherit.yml": {netip.MustParsePrefix("fd42:7669::1/128")},
+		"override.yml": {netip.MustParsePrefix("fd42:7669::2/128"), netip.MustParsePrefix("10.99.0.1/32"),
+			netip.MustParsePrefix("10.99.0.2/32"), netip.MustParsePrefix("10.99.0.3/32")},
+		"clear.yml": nil,
+	} {
+		c, raw, addrs, err := loadConfig(dir, name, slog.Default())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !reflect.DeepEqual(addrs, want) {
+			t.Errorf("%s: addresses = %v, want %v", name, addrs, want)
+		}
+		// Nebula must not see our key, and changing only it must not reload Nebula
+		if c.Get(unsafeAddressesKey) != nil || strings.Contains(raw, unsafeAddressesKey) {
+			t.Errorf("%s: %s was passed to Nebula", name, unsafeAddressesKey)
+		}
+		if c.GetInt("listen.port", 0) != 1 {
+			t.Errorf("%s: rest of config was lost", name)
+		}
+	}
+}
+
+func TestInvalidUnsafeAddresses(t *testing.T) {
+	for _, value := range []string{
+		`"fd42:7669::1"`, `[fd42:7669::/64]`, `[10.99.0.0/24]`, `[not-an-address]`, `[1]`,
+		`[{address: "fd42:7669::1"}]`, `["fe80::1%lo"]`,
+	} {
+		dir := t.TempDir()
+		writeConfig(t, dir, "endpoint.yml", "unsafe_addresses: "+value+"\n")
+		if _, _, _, err := loadConfig(dir, "endpoint.yml", slog.Default()); err == nil {
+			t.Errorf("unsafe_addresses %s was accepted", value)
+		} else if !strings.Contains(err.Error(), "config endpoint.yml") {
+			t.Errorf("unsafe_addresses %s: error %q does not name config", value, err)
+		}
 	}
 }

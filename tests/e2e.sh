@@ -45,9 +45,9 @@ for tool in podman nebula-cert jq ip nsenter timeout; do
 done
 [[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] || fail 'A readable/writable /dev/net/tun character device is required.'
 [[ -x "$daemon" && -x "$plugin" ]] || fail 'Build both binaries first: go tool task build'
-[[ $port_base =~ ^[0-9]{1,5}$ ]] || fail 'UDP port base must be an integer between 1024 and 65532.'
+[[ $port_base =~ ^[0-9]{1,5}$ ]] || fail 'UDP port base must be an integer between 1024 and 65531.'
 port_base=$((10#$port_base))
-((port_base >= 1024 && port_base <= 65532)) || fail 'UDP port base must be between 1024 and 65532 (four ports are used, including the retry and host scenarios).'
+((port_base >= 1024 && port_base <= 65531)) || fail 'UDP port base must be between 1024 and 65531 (five ports are used, including the retry, host and backup scenarios).'
 [[ $(cat /proc/sys/net/ipv6/conf/lo/disable_ipv6) == 0 ]] || fail 'IPv6 must be enabled on the host loopback interface.'
 ip -6 -o addr show dev lo | jq -Rse 'contains("::1/128")' >/dev/null || fail 'Host loopback must have ::1/128.'
 cert_help=$(nebula-cert sign -help 2>&1 || true)
@@ -62,9 +62,16 @@ containers=()
 network="nn-e2e-${work##*.}"
 name_a="$network-a"
 name_b="$network-b"
+name_c="$network-c"
 addr_a=fd42:6e62::2
 addr_b=fd42:6e62::3
+addr_c=fd42:6e62::5
 addr_host=fd42:6e62::1
+# Served by b, with c as backup; host address is random to not clash with other runs
+vip_net=fd42:7669::/64
+vip=fd42:7669::1
+vip_extra=fd42:7669::2
+host_vip=fd42:7669::f:$((RANDOM % 10000))
 host_dev="nn-${work##*.}"
 mkdir -p "$work"/{bin,plugins,config,state,certs,storage,runroot,networks,tmp,logs}
 cp -- "$daemon" "$work/bin/nebula-netavarkd"
@@ -162,6 +169,8 @@ cleanup() {
         fi
         wait "$daemon_pid" 2>/dev/null
     fi
+    # Stopping the daemon should have removed this already, but don't leak it on failure
+    ip -6 addr del "$host_vip/128" dev lo 2>/dev/null
     if ((success && rc == 0)); then
         rm -rf -- "$work"
         printf '\nPASS: IPv6 Podman end-to-end tests\n'
@@ -201,13 +210,15 @@ tun:
   dev: nebula-test
 firewall:
   inbound:
-    - {port: any, proto: any, host: any}
+    # Without local_cidr, rules only match VPN addresses, not unsafe addresses
+    - {port: any, proto: any, host: any, local_cidr: any}
   outbound:
     - {port: any, proto: any, host: any}
 EOF
 write_endpoint() {
-    local name=$1 address=$2 peer=$3 port=$4 peer_port=$5
+    local name=$1 address=$2 peer=$3 port=$4 peer_port=$5 unsafe=${6:-}
     nebula-cert sign -name "$name" -version 2 -networks "$address/64" -duration 30m \
+        ${unsafe:+-unsafe-networks "$unsafe"} \
         -ca-crt "$work/certs/ca.crt" -ca-key "$work/certs/ca.key" \
         -out-crt "$work/certs/$name.crt" -out-key "$work/certs/$name.key"
     cat >"$work/config/$name.yml" <<EOF
@@ -222,10 +233,26 @@ listen:
 EOF
 }
 write_endpoint "$name_a" "$addr_a" "$addr_b" "$port_base" "$((port_base + 1))"
-write_endpoint "$name_b" "$addr_b" "$addr_a" "$((port_base + 1))" "$port_base"
+write_endpoint "$name_b" "$addr_b" "$addr_a" "$((port_base + 1))" "$port_base" "$vip_net"
+write_endpoint "$name_c" "$addr_c" "$addr_a" "$((port_base + 4))" "$port_base" "$vip_net"
+printf 'unsafe_addresses: ["%s"]\n' "$vip" | tee -a "$work/config/$name_b.yml" >>"$work/config/$name_c.yml"
+cp "$work/config/$name_b.yml" "$work/b-original.yml"
+# a also needs to find c; static_host_map isn't the last section, so insert there
+sed -i "/^static_host_map:/a\\  \"$addr_c\": [\"[::1]:$((port_base + 4))\"]" "$work/config/$name_a.yml"
+# Huge weight makes b primary; c only gets traffic when b is unreachable
+cat >>"$work/config/$name_a.yml" <<EOF
+tun:
+  unsafe_routes:
+    - route: $vip_net
+      install: true
+      via:
+        - {gateway: "$addr_b", weight: 1000000}
+        - {gateway: "$addr_c", weight: 1}
+EOF
 write_endpoint "$network-retry" fd42:6e62::4 "$addr_b" "$((port_base + 2))" "$((port_base + 1))"
 # Host endpoint only answers; containers find it through the shared static_host_map
 nebula-cert sign -name "$network-host" -version 2 -networks "$addr_host/64" -duration 30m \
+    -unsafe-networks "$host_vip/128" \
     -ca-crt "$work/certs/ca.crt" -ca-key "$work/certs/ca.key" \
     -out-crt "$work/certs/$network-host.crt" -out-key "$work/certs/$network-host.key"
 cat >"$work/config/_host.yml" <<EOF
@@ -238,6 +265,7 @@ listen:
   port: $((port_base + 3))
 tun:
   dev: "$host_dev"
+unsafe_addresses: ["$host_vip"]
 EOF
 start_daemon
 
@@ -278,6 +306,9 @@ pm run -d --name "$name_a" "${run_args[@]}" "$image" sleep 1d
 containers+=("$name_b")
 pm run -d --name "$name_b" "${run_args[@]}" "$image" sh -c \
     'mkdir -p /www; printf "nebula-ipv6-ok\n" > /www/index.html; exec httpd -f -p "[::]:8080" -h /www'
+containers+=("$name_c")
+pm run -d --name "$name_c" "${run_args[@]}" "$image" sh -c \
+    'mkdir -p /www; printf "backup-ok\n" > /www/index.html; exec httpd -f -p "[::]:8080" -h /www'
 
 container_pid() { pm inspect "$1" | jq -er '.[0].State.Pid | select(. > 0)'; }
 check_metadata() {
@@ -303,7 +334,26 @@ check_metadata() {
 check_host() {
     ip -j -6 addr show dev "$host_dev" >"$work/logs/host-addresses.json" &&
         jq -e --arg ip "$addr_host" '.[0].addr_info | any(.local == $ip and .prefixlen == 64)' \
-            "$work/logs/host-addresses.json" >/dev/null
+            "$work/logs/host-addresses.json" >/dev/null &&
+        has_loopback_addr "$host_vip"
+}
+# Checks loopback of container given as optional second argument, or host
+has_loopback_addr() {
+    local address=$1 pid
+    if [[ -n ${2:-} ]]; then
+        pid=$(container_pid "$2") || return 1
+        nsenter -t "$pid" -n ip -j -6 addr show dev lo
+    else
+        ip -j -6 addr show dev lo
+    fi | jq -e --arg ip "$address" '.[0].addr_info | any(.local == $ip and .prefixlen == 128)' >/dev/null
+}
+lacks_loopback_addr() { ! has_loopback_addr "$@"; }
+vip_served_by() {
+    [[ $(pm exec "$name_a" wget -Y off -q -T 3 -O - "http://[$vip]:8080/") == "$1" ]]
+}
+check_vip() {
+    has_loopback_addr "$vip" "$name_b" && has_loopback_addr "$vip" "$name_c" &&
+        vip_served_by nebula-ipv6-ok
 }
 check_traffic() {
     pm exec "$name_a" ping -6 -c 1 -W 2 "$addr_b" &&
@@ -324,12 +374,35 @@ check_endpoints() {
         tail -n 40 "$work/logs/retries.log" >&2
         fail "IPv6 metadata mismatch for $name_b."
     fi
+    if ! wait_until check_metadata "$name_c" "$addr_c"; then
+        tail -n 40 "$work/logs/retries.log" >&2
+        fail "IPv6 metadata mismatch for $name_c."
+    fi
     if ! wait_until check_traffic; then
         tail -n 40 "$work/logs/retries.log" >&2
         fail 'IPv6 ping/HTTP did not recover.'
     fi
+    if ! wait_until check_vip; then
+        tail -n 40 "$work/logs/retries.log" >&2
+        fail 'Unsafe address is missing or not served by primary.'
+    fi
 }
 check_endpoints
+
+log 'Checking unsafe address failover and failback'
+pm stop --time 2 "$name_b"
+wait_until vip_served_by backup-ok || fail 'Unsafe address did not fail over to backup.'
+pm start "$name_b"
+wait_until check_vip || fail 'Unsafe address did not fail back to primary.'
+
+log 'Checking unsafe address reload'
+# YAML forbids duplicate keys, so replace the line instead of appending
+sed "s|^unsafe_addresses:.*|unsafe_addresses: [\"$vip\", \"$vip_extra\"]|" \
+    "$work/b-original.yml" >"$work/config/$name_b.yml"
+wait_until has_loopback_addr "$vip_extra" "$name_b" || fail 'Added unsafe address did not appear.'
+cp "$work/b-original.yml" "$work/config/$name_b.yml"
+wait_until lacks_loopback_addr "$vip_extra" "$name_b" || fail 'Removed unsafe address did not disappear.'
+has_loopback_addr "$vip" "$name_b" || fail 'Reload removed an unsafe address that is still configured.'
 
 log 'Checking container stop/start and endpoint persistence'
 pm stop --time 2 "$name_a"
@@ -348,6 +421,10 @@ for signal in TERM KILL; do
     fi
     stop_daemon "$signal"
     [[ -s "$work/state/$name_a" && -s "$work/state/$name_b" ]] || fail 'Daemon shutdown removed restart state.'
+    if [[ $signal == TERM ]]; then
+        lacks_loopback_addr "$vip" "$name_b" || fail 'Daemon shutdown left unsafe address in container.'
+        lacks_loopback_addr "$host_vip" || fail 'Daemon shutdown left unsafe address on host.'
+    fi
     start_daemon
     [[ ! -e "$work/state/stale" ]] || fail 'Recovery did not remove a stale namespace entry.'
     check_endpoints
@@ -384,6 +461,6 @@ pm stop --time 2 "$network-retry"
 check_endpoints
 
 log 'Checking final teardown'
-pm stop --time 2 "$name_a" "$name_b"
-[[ ! -e "$work/state/$name_a" && ! -e "$work/state/$name_b" ]] || fail 'Final teardown left endpoint state.'
+pm stop --time 2 "$name_a" "$name_b" "$name_c"
+[[ ! -e "$work/state/$name_a" && ! -e "$work/state/$name_b" && ! -e "$work/state/$name_c" ]] || fail 'Final teardown left endpoint state.'
 success=1

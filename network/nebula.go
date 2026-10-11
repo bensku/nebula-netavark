@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"sync"
 
 	"github.com/slackhq/nebula"
@@ -28,8 +29,10 @@ type runningEndpoint struct {
 	netns   string // Empty for host endpoint
 	dir     string
 	name    string
-	raw     string // Currently applied config
-	lastErr string // Last config error, to avoid logging it repeatedly
+	raw     string         // Currently applied config
+	addrs   []netip.Prefix // Currently applied unsafe addresses
+	lastErr string         // Last config error, to avoid logging it repeatedly
+	logger  *slog.Logger
 }
 
 // Reloads endpoint config from disk if its effective content has changed
@@ -39,7 +42,7 @@ func (endpoint *runningEndpoint) reloadIfChanged(logger *slog.Logger) {
 	if endpoint.stopped {
 		return
 	}
-	_, raw, err := loadConfig(endpoint.dir, endpoint.name, logger)
+	_, raw, addrs, err := loadConfig(endpoint.dir, endpoint.name, logger)
 	if err == nil && raw != endpoint.raw {
 		var enterErr error
 		_, err, enterErr = inNetns(endpoint.netns, func() (struct{}, error) {
@@ -49,6 +52,21 @@ func (endpoint *runningEndpoint) reloadIfChanged(logger *slog.Logger) {
 		if err == nil {
 			endpoint.raw = raw
 			logger.Info("reloaded endpoint config", "config", endpoint.name)
+		}
+	}
+	// Certificate may have changed even if addresses did not, so always check them
+	if err == nil {
+		warnUncoveredAddresses(logger, endpoint.name, endpoint.ctrl, addrs)
+	}
+	if err == nil && !slices.Equal(addrs, endpoint.addrs) {
+		var enterErr error
+		_, err, enterErr = inNetns(endpoint.netns, func() (struct{}, error) {
+			return struct{}{}, syncUnsafeAddresses(endpoint.addrs, addrs)
+		})
+		err = errors.Join(enterErr, err)
+		if err == nil {
+			endpoint.addrs = addrs
+			logger.Info("updated unsafe addresses", "config", endpoint.name, "addresses", addrs)
 		}
 	}
 	if err != nil {
@@ -66,13 +84,24 @@ func (endpoint *runningEndpoint) stop() {
 	endpoint.mu.Lock()
 	defer endpoint.mu.Unlock()
 	endpoint.stopped = true
+	// Stopping Nebula first closes tunnels, so peers fail over before addresses disappear
 	endpoint.ctrl.Stop()
+	if len(endpoint.addrs) == 0 {
+		return
+	}
+	_, err, enterErr := inNetns(endpoint.netns, func() (struct{}, error) {
+		return struct{}{}, syncUnsafeAddresses(endpoint.addrs, nil)
+	})
+	// If netns is already gone, so are the addresses
+	if enterErr == nil && err != nil {
+		endpoint.logger.Warn("failed to remove unsafe addresses", "config", endpoint.name, "error", err)
+	}
 }
 
 // Starts Nebula endpoint, loading config name from dir and putting TUN to given netns
 // Empty netns keeps TUN in host netns
 func (tunnels *tunnelManager) start(dir string, name string, netns string) (*runningEndpoint, error) {
-	c, raw, err := loadConfig(dir, name, tunnels.logger)
+	c, raw, addrs, err := loadConfig(dir, name, tunnels.logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load Nebula config in %s: %w", dir, err)
 	}
@@ -96,7 +125,21 @@ func (tunnels *tunnelManager) start(dir string, name string, netns string) (*run
 		return nil, fmt.Errorf("failed to start endpoint: %w", err)
 	}
 
-	return &runningEndpoint{ctrl: ctrl, config: c, netns: netns, dir: dir, name: name, raw: raw}, nil
+	warnUncoveredAddresses(tunnels.logger, name, ctrl, addrs)
+	_, err, enterErr = inNetns(netns, func() (struct{}, error) {
+		return struct{}{}, syncUnsafeAddresses(nil, addrs)
+	})
+	if err = errors.Join(enterErr, err); err != nil {
+		ctrl.Stop()
+		// Don't leave partially added addresses behind
+		_, _, _ = inNetns(netns, func() (struct{}, error) {
+			return struct{}{}, syncUnsafeAddresses(addrs, nil)
+		})
+		return nil, fmt.Errorf("failed to add unsafe addresses: %w", err)
+	}
+
+	return &runningEndpoint{ctrl: ctrl, config: c, netns: netns, dir: dir, name: name, raw: raw, addrs: addrs,
+		logger: tunnels.logger}, nil
 }
 
 // Like netnsExec, but runs f in current (host) netns if netns is empty

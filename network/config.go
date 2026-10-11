@@ -3,6 +3,7 @@ package network
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 
@@ -14,21 +15,27 @@ import (
 const maxImportDepth = 8
 
 // Loads config file name from dir, expanding imports
-// Also returns the merged settings as YAML, so callers can detect changes
-func loadConfig(dir, name string, logger *slog.Logger) (*config.C, string, error) {
+// Also returns the merged Nebula settings as YAML, so callers can detect changes,
+// and unsafe addresses which are not given to Nebula
+func loadConfig(dir, name string, logger *slog.Logger) (*config.C, string, []netip.Prefix, error) {
 	settings, err := loadSettings(dir, name, 0)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
+	addrs, err := parseUnsafeAddresses(settings[unsafeAddressesKey])
+	if err != nil {
+		return nil, "", nil, fmt.Errorf("config %s: %w", name, err)
+	}
+	delete(settings, unsafeAddressesKey)
 	raw, err := yaml.Marshal(settings)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	// Pathless configs prevent Nebula from installing a SIGHUP handler which
 	// would bypass import expansion; we reload on file changes instead.
 	c := config.NewC(logger)
 	c.Settings = settings
-	return c, string(raw), nil
+	return c, string(raw), addrs, nil
 }
 
 func loadSettings(dir, name string, depth int) (map[string]any, error) {
