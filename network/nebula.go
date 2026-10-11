@@ -25,7 +25,7 @@ type runningEndpoint struct {
 	stopped bool
 	ctrl    *nebula.Control
 	config  *config.C
-	netns   string
+	netns   string // Empty for host endpoint
 	dir     string
 	name    string
 	raw     string // Currently applied config
@@ -42,7 +42,7 @@ func (endpoint *runningEndpoint) reloadIfChanged(logger *slog.Logger) {
 	_, raw, err := loadConfig(endpoint.dir, endpoint.name, logger)
 	if err == nil && raw != endpoint.raw {
 		var enterErr error
-		_, err, enterErr = netnsExec(endpoint.netns, func() (struct{}, error) {
+		_, err, enterErr = inNetns(endpoint.netns, func() (struct{}, error) {
 			return struct{}{}, endpoint.config.ReloadConfigString(raw)
 		})
 		err = errors.Join(enterErr, err)
@@ -70,18 +70,23 @@ func (endpoint *runningEndpoint) stop() {
 }
 
 // Starts Nebula endpoint, loading config name from dir and putting TUN to given netns
+// Empty netns keeps TUN in host netns
 func (tunnels *tunnelManager) start(dir string, name string, netns string) (*runningEndpoint, error) {
 	c, raw, err := loadConfig(dir, name, tunnels.logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load Nebula config in %s: %w", dir, err)
 	}
 
-	ctrl, err := nebula.Main(c, false, Build, tunnels.logger, namespacedFactory(netns))
+	var factory overlay.DeviceFactory // nil makes Nebula use host netns
+	if netns != "" {
+		factory = namespacedFactory(netns)
+	}
+	ctrl, err := nebula.Main(c, false, Build, tunnels.logger, factory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize: %w", err)
 	}
 
-	_, err, enterErr := netnsExec(netns, func() (func() error, error) {
+	_, err, enterErr := inNetns(netns, func() (func() error, error) {
 		return ctrl.Start()
 	})
 	if enterErr != nil {
@@ -92,6 +97,15 @@ func (tunnels *tunnelManager) start(dir string, name string, netns string) (*run
 	}
 
 	return &runningEndpoint{ctrl: ctrl, config: c, netns: netns, dir: dir, name: name, raw: raw}, nil
+}
+
+// Like netnsExec, but runs f in current (host) netns if netns is empty
+func inNetns[T any](netns string, f func() (T, error)) (T, error, error) {
+	if netns == "" {
+		out, err := f()
+		return out, err, nil
+	}
+	return netnsExec(netns, f)
 }
 
 func namespacedFactory(netns string) overlay.DeviceFactory {

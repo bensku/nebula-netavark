@@ -45,9 +45,9 @@ for tool in podman nebula-cert jq ip nsenter timeout; do
 done
 [[ -c /dev/net/tun && -r /dev/net/tun && -w /dev/net/tun ]] || fail 'A readable/writable /dev/net/tun character device is required.'
 [[ -x "$daemon" && -x "$plugin" ]] || fail 'Build both binaries first: go tool task build'
-[[ $port_base =~ ^[0-9]{1,5}$ ]] || fail 'UDP port base must be an integer between 1024 and 65533.'
+[[ $port_base =~ ^[0-9]{1,5}$ ]] || fail 'UDP port base must be an integer between 1024 and 65532.'
 port_base=$((10#$port_base))
-((port_base >= 1024 && port_base <= 65533)) || fail 'UDP port base must be between 1024 and 65533 (three ports are used, including the retry scenario).'
+((port_base >= 1024 && port_base <= 65532)) || fail 'UDP port base must be between 1024 and 65532 (four ports are used, including the retry and host scenarios).'
 [[ $(cat /proc/sys/net/ipv6/conf/lo/disable_ipv6) == 0 ]] || fail 'IPv6 must be enabled on the host loopback interface.'
 ip -6 -o addr show dev lo | jq -Rse 'contains("::1/128")' >/dev/null || fail 'Host loopback must have ::1/128.'
 cert_help=$(nebula-cert sign -help 2>&1 || true)
@@ -64,6 +64,8 @@ name_a="$network-a"
 name_b="$network-b"
 addr_a=fd42:6e62::2
 addr_b=fd42:6e62::3
+addr_host=fd42:6e62::1
+host_dev="nn-${work##*.}"
 mkdir -p "$work"/{bin,plugins,config,state,certs,storage,runroot,networks,tmp,logs}
 cp -- "$daemon" "$work/bin/nebula-netavarkd"
 cp -- "$plugin" "$work/bin/nebula-netavark-plugin"
@@ -107,7 +109,7 @@ start_daemon() {
     "$daemon" --socket "$socket" --config "$work/config" --state "$work/state" \
         >>"$work/logs/daemon.log" 2>&1 &
     daemon_pid=$!
-    wait_until daemon_ready || fail "Daemon did not become ready; check $work/logs/daemon.log (UDP ports $port_base–$((port_base + 2)))."
+    wait_until daemon_ready || fail "Daemon did not become ready; check $work/logs/daemon.log (UDP ports $port_base–$((port_base + 3)))."
 }
 
 stop_daemon() {
@@ -193,6 +195,8 @@ lighthouse:
   hosts: []
 listen:
   host: "::1"
+static_host_map:
+  "$addr_host": ["[::1]:$((port_base + 3))"]
 tun:
   dev: nebula-test
 firewall:
@@ -220,6 +224,21 @@ EOF
 write_endpoint "$name_a" "$addr_a" "$addr_b" "$port_base" "$((port_base + 1))"
 write_endpoint "$name_b" "$addr_b" "$addr_a" "$((port_base + 1))" "$port_base"
 write_endpoint "$network-retry" fd42:6e62::4 "$addr_b" "$((port_base + 2))" "$((port_base + 1))"
+# Host endpoint only answers; containers find it through the shared static_host_map
+nebula-cert sign -name "$network-host" -version 2 -networks "$addr_host/64" -duration 30m \
+    -ca-crt "$work/certs/ca.crt" -ca-key "$work/certs/ca.key" \
+    -out-crt "$work/certs/$network-host.crt" -out-key "$work/certs/$network-host.key"
+cat >"$work/config/_host.yml" <<EOF
+import: network.yml
+pki:
+  cert: "$work/certs/$network-host.crt"
+  key: "$work/certs/$network-host.key"
+static_host_map: null
+listen:
+  port: $((port_base + 3))
+tun:
+  dev: "$host_dev"
+EOF
 start_daemon
 
 log 'Checking plugin discovery and creating the IPv6 network'
@@ -281,12 +300,22 @@ check_metadata() {
         "$work/logs/$name-inspect.json" >/dev/null || { printf 'Podman IPv6 inspect mismatch for %s\n' "$name" >&2; return 1; }
     [[ -s "$work/state/$name" ]]
 }
+check_host() {
+    ip -j -6 addr show dev "$host_dev" >"$work/logs/host-addresses.json" &&
+        jq -e --arg ip "$addr_host" '.[0].addr_info | any(.local == $ip and .prefixlen == 64)' \
+            "$work/logs/host-addresses.json" >/dev/null
+}
 check_traffic() {
     pm exec "$name_a" ping -6 -c 1 -W 2 "$addr_b" &&
+        pm exec "$name_a" ping -6 -c 1 -W 2 "$addr_host" &&
         pm exec "$name_b" ping -6 -c 1 -W 2 "$addr_a" &&
         [[ $(pm exec "$name_a" wget -Y off -q -T 3 -O - "http://[$addr_b]:8080/") == nebula-ipv6-ok ]]
 }
 check_endpoints() {
+    if ! wait_until check_host; then
+        tail -n 40 "$work/logs/retries.log" >&2
+        fail "Host endpoint $host_dev is missing or has wrong address."
+    fi
     if ! wait_until check_metadata "$name_a" "$addr_a"; then
         tail -n 40 "$work/logs/retries.log" >&2
         fail "IPv6 metadata mismatch for $name_a."

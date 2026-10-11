@@ -62,6 +62,24 @@ the file is fixed.
 Symlinked subdirectories are not supported, and changes to symlink targets
 outside the config directory are not detected.
 
+## Host endpoint
+
+If `_host.yml` exists in the config directory, the daemon also runs Nebula for
+the host itself, with its interface in the host network namespace. This can
+replace a separate Nebula service. Container names can't start with an
+underscore, so this can't clash with container configs.
+
+`_host.yml` supports imports and reloading like any other config. Every endpoint
+shares the host's UDP stack, so give the host endpoint its own `listen.port`
+(e.g. 4242) and keep containers on `port: 0`.
+
+If the host endpoint fails to start, the error is logged and containers keep
+working; startup is retried when config changes. Removing `_host.yml` does not
+stop a running host endpoint; restart the daemon for that.
+
+Note that restarting or upgrading the daemon also briefly takes down the host's
+Nebula connection, not just containers'.
+
 ## Testing
 Run unit/regression tests with:
 ```sh

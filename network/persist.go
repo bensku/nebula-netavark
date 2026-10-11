@@ -85,7 +85,8 @@ func (db *endpointDb) Remove(container string) error {
 }
 
 func validateContainerId(container string) error {
-	if container == "" || container == "." || container == ".." ||
+	// Leading underscore is reserved for our own configs, such as host endpoint
+	if container == "" || container == "." || container == ".." || strings.HasPrefix(container, "_") ||
 		strings.ContainsAny(container, "/\\") || strings.Contains(container, ".tmp-") {
 		return fmt.Errorf("invalid container id: %q", container)
 	}

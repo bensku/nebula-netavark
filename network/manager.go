@@ -1,6 +1,7 @@
 package network
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
@@ -11,6 +12,10 @@ import (
 	"github.com/slackhq/nebula/logging"
 )
 
+// Config for Nebula running in host netns. Container names can't start with
+// underscore, so this can't clash with container configs
+const hostConfig = "_host.yml"
+
 // Manager for Nebula endpoints
 type Manager struct {
 	configDir string
@@ -18,6 +23,9 @@ type Manager struct {
 	db        endpointDb
 
 	endpoints sync.Map
+	hostMu    sync.Mutex
+	host      *runningEndpoint // nil if not configured or failed to start
+	hostErr   string           // Last host start error, to avoid logging it repeatedly
 	lifecycle sync.RWMutex
 	closed    bool
 	stopWatch chan struct{}
@@ -49,6 +57,10 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 	// Start watching before endpoints come up, so we don't miss changes
 	mgr.stopWatch = make(chan struct{})
 	mgr.watchDone = watchConfigDir(configDir, mgr.tunnels.logger, mgr.reload, mgr.stopWatch)
+
+	// Host endpoint failing shouldn't prevent containers from working
+	// It will be retried when config changes
+	mgr.syncHost()
 
 	// Reconnect all existing endpoints
 	endpoints, err := mgr.db.List()
@@ -146,6 +158,12 @@ func (mgr *Manager) Close() {
 	mgr.closed = true
 	close(mgr.stopWatch)
 	<-mgr.watchDone
+	mgr.hostMu.Lock()
+	if mgr.host != nil {
+		mgr.host.stop()
+		mgr.host = nil
+	}
+	mgr.hostMu.Unlock()
 	mgr.endpoints.Range(func(key, value any) bool {
 		value.(*runningEndpoint).stop()
 		mgr.endpoints.Delete(key)
@@ -155,10 +173,37 @@ func (mgr *Manager) Close() {
 
 // Reloads configs of all endpoints whose config files have changed
 func (mgr *Manager) reload() {
+	mgr.syncHost()
 	mgr.endpoints.Range(func(key, value any) bool {
 		if endpoint, ok := value.(*runningEndpoint); ok { // Skip markers
 			endpoint.reloadIfChanged(mgr.tunnels.logger)
 		}
 		return true
 	})
+}
+
+// Starts host endpoint if it is configured but not running, otherwise reloads it
+// Removing host config doesn't stop the endpoint, just like with containers
+func (mgr *Manager) syncHost() {
+	mgr.hostMu.Lock()
+	defer mgr.hostMu.Unlock()
+	if mgr.host != nil {
+		mgr.host.reloadIfChanged(mgr.tunnels.logger)
+		return
+	}
+	if _, err := os.Stat(filepath.Join(mgr.configDir, hostConfig)); errors.Is(err, os.ErrNotExist) {
+		mgr.hostErr = ""
+		return
+	}
+	endpoint, err := mgr.tunnels.start(mgr.configDir, hostConfig, "")
+	if err != nil {
+		if err.Error() != mgr.hostErr {
+			mgr.tunnels.logger.Error("failed to start host endpoint", "config", hostConfig, "error", err)
+		}
+		mgr.hostErr = err.Error()
+		return
+	}
+	mgr.host = endpoint
+	mgr.hostErr = ""
+	mgr.tunnels.logger.Info("started host endpoint", "config", hostConfig, "interface", endpoint.ctrl.Device().Name())
 }
