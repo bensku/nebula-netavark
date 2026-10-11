@@ -116,7 +116,7 @@ func (tunnels *tunnelManager) start(dir string, name string, netns string) (*run
 	}
 
 	_, err, enterErr := inNetns(netns, func() (func() error, error) {
-		return ctrl.Start()
+		return nil, ctrl.Start()
 	})
 	if enterErr != nil {
 		return nil, fmt.Errorf("failed to enter netns for endpoint start: %w", enterErr)
