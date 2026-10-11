@@ -237,3 +237,78 @@ func TestInvalidUnsafeAddresses(t *testing.T) {
 		}
 	}
 }
+
+func TestNamedRoutes(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "network.yml", `
+named_routes:
+  vip: {route: "fd42:7669::1/128", via: "fd42:6e62::3", default: true}
+  internet: {route: "::/0", via: "fd42:6e62::1"}
+  another_vip: {route: "fd42:7669::2/128", via: "fd42:6e62::4", default: true}
+listen: {port: 1}
+`)
+	writeConfig(t, dir, "defaults.yml", "import: network.yml\n")
+	writeConfig(t, dir, "enabled.yml", `
+import: network.yml
+enable_routes: [internet]
+tun: {unsafe_routes: [{route: "10.99.0.0/24", via: "fd42:6e62::9"}]}
+`)
+	writeConfig(t, dir, "opt-out.yml", `
+import: network.yml
+named_routes: {vip: {default: false}, another_vip: null}
+`)
+	writeConfig(t, dir, "re-enabled.yml", `
+import: network.yml
+named_routes: {vip: {default: false}}
+enable_routes: [vip]
+`)
+	vip := map[string]any{"route": "fd42:7669::1/128", "via": "fd42:6e62::3"}
+	anotherVip := map[string]any{"route": "fd42:7669::2/128", "via": "fd42:6e62::4"}
+	internet := map[string]any{"route": "::/0", "via": "fd42:6e62::1"}
+	static := map[string]any{"route": "10.99.0.0/24", "via": "fd42:6e62::9"}
+	for name, want := range map[string]any{
+		"defaults.yml":   []any{anotherVip, vip},
+		"enabled.yml":    []any{static, anotherVip, internet, vip},
+		"opt-out.yml":    nil,
+		"re-enabled.yml": []any{anotherVip, vip},
+	} {
+		c, raw, _, err := loadConfig(dir, name, slog.Default())
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got := c.Get("tun.unsafe_routes"); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: unsafe_routes = %#v, want %#v", name, got, want)
+		}
+		for _, key := range []string{namedRoutesKey, enableRoutesKey, "default"} {
+			if strings.Contains(raw, key) {
+				t.Errorf("%s: %s was passed to Nebula", name, key)
+			}
+		}
+		if c.GetInt("listen.port", 0) != 1 {
+			t.Errorf("%s: rest of config was lost", name)
+		}
+	}
+}
+
+func TestInvalidNamedRoutes(t *testing.T) {
+	for _, tc := range []struct{ name, yaml, want string }{
+		{"routes list", "named_routes: [{route: '::/0'}]", "named_routes must be"},
+		{"route scalar", "named_routes: {vip: '::/0'}", `route "vip" must be`},
+		{"default string", "named_routes: {vip: {route: '::/0', default: 'yes'}}", "default must be"},
+		{"enable scalar", "named_routes: {vip: {route: '::/0'}}\nenable_routes: vip", "enable_routes must be"},
+		{"enable number", "named_routes: {vip: {route: '::/0'}}\nenable_routes: [1]", "enable_routes must be"},
+		{"unknown", "named_routes: {vip: {route: '::/0'}}\nenable_routes: [vpi]", `route "vpi" is not`},
+		{"removed", "named_routes: {vip: null}\nenable_routes: [vip]", `route "vip" is not`},
+		{"bad unsafe_routes", "named_routes: {vip: {route: '::/0', default: true}}\ntun: {unsafe_routes: x}", "tun.unsafe_routes"},
+		{"bad tun", "named_routes: {vip: {route: '::/0', default: true}}\ntun: x", "tun must be"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, "endpoint.yml", tc.yaml+"\n")
+			_, _, _, err := loadConfig(dir, "endpoint.yml", slog.Default())
+			if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "config endpoint.yml") {
+				t.Fatalf("error = %v, want endpoint context and %q", err, tc.want)
+			}
+		})
+	}
+}

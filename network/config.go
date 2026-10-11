@@ -17,6 +17,7 @@ const maxImportDepth = 8
 // Loads config file name from dir, expanding imports
 // Also returns the merged Nebula settings as YAML, so callers can detect changes,
 // and unsafe addresses which are not given to Nebula
+// Named routes are expanded into tun.unsafe_routes
 func loadConfig(dir, name string, logger *slog.Logger) (*config.C, string, []netip.Prefix, error) {
 	settings, err := loadSettings(dir, name, 0)
 	if err != nil {
@@ -27,6 +28,9 @@ func loadConfig(dir, name string, logger *slog.Logger) (*config.C, string, []net
 		return nil, "", nil, fmt.Errorf("config %s: %w", name, err)
 	}
 	delete(settings, unsafeAddressesKey)
+	if err := expandNamedRoutes(settings); err != nil {
+		return nil, "", nil, fmt.Errorf("config %s: %w", name, err)
+	}
 	raw, err := yaml.Marshal(settings)
 	if err != nil {
 		return nil, "", nil, err

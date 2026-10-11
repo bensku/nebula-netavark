@@ -93,6 +93,43 @@ tun:
           weight: 1
 ```
 
+## Named routes
+Using `unsafe_routes` with imports is all fine and dandy... until you need
+some of them not be enabled by default. Then, it is not so nice anymore.
+You can replace entire `unsafe_routes`, sure, but that rather significantly
+reduces usefulness of the imports.
+
+Hence, enter `named_routes`. In `network.yml`, you can declare routes:
+Shared configs can define unsafe routes by name in `named_routes`. Each entry
+takes the same options as an entry in `tun.unsafe_routes`, plus `default`.
+Routes with `default: true` are appended to `tun.unsafe_routes` of every
+endpoint that imports them; others are only added when listed in `enable_routes`:
+
+```yaml
+# network.yml
+named_routes:
+  backend-vip:
+    route: fd42:7669::1/128
+    via: "fd42:6e62::3"
+    install: true
+    default: true # Every endpoint gets this
+  internet:
+    route: ::/0
+    via: "fd42:6e62::1"
+    # default: false - only for endpoints that ask for it
+```
+Some of them might be enabled by default. Others, endpoints can opt in to:
+
+```yaml
+# proxy.yml
+import: network.yml
+enable_routes: [internet]
+```
+
+All enabled routes are converted to `unsafe_routes` by nebula-netavarkd.
+See [Nebula documentation](https://nebula.defined.net/docs/config/tun/#tununsafe_routes)
+about unsafe routes.
+
 ## Testing
 Run unit/regression tests with:
 ```sh
