@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/slackhq/nebula"
 	"github.com/slackhq/nebula/logging"
 )
 
@@ -19,6 +18,10 @@ type Manager struct {
 	db        endpointDb
 
 	endpoints sync.Map
+	lifecycle sync.RWMutex
+	closed    bool
+	stopWatch chan struct{}
+	watchDone <-chan struct{}
 }
 
 // EndpointInfo describes the interface and addresses actually assigned by Nebula.
@@ -43,9 +46,14 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 		endpoints: sync.Map{},
 	}
 
+	// Start watching before endpoints come up, so we don't miss changes
+	mgr.stopWatch = make(chan struct{})
+	mgr.watchDone = watchConfigDir(configDir, mgr.tunnels.logger, mgr.reload, mgr.stopWatch)
+
 	// Reconnect all existing endpoints
 	endpoints, err := mgr.db.List()
 	if err != nil {
+		mgr.Close()
 		return nil, err
 	}
 	for container, netns := range endpoints {
@@ -59,6 +67,14 @@ func LoadManager(configDir string, stateDir string) (*Manager, error) {
 
 // Brings an endpoint up for given container netns
 func (mgr *Manager) Up(container string, netns string) (EndpointInfo, error) {
+	mgr.lifecycle.RLock()
+	defer mgr.lifecycle.RUnlock()
+	if mgr.closed {
+		return EndpointInfo{}, fmt.Errorf("manager closed")
+	}
+	if err := validateContainerId(container); err != nil {
+		return EndpointInfo{}, err
+	}
 	cfg := filepath.Join(mgr.configDir, container+".yml")
 	if _, err := os.Stat(cfg); err != nil {
 		return EndpointInfo{}, fmt.Errorf("could not load config %s: %w", cfg, err)
@@ -71,23 +87,25 @@ func (mgr *Manager) Up(container string, netns string) (EndpointInfo, error) {
 	}
 
 	// Start up Nebula endpoint
-	ctrl, err := mgr.tunnels.start(cfg, netns)
+	endpoint, err := mgr.tunnels.start(mgr.configDir, container+".yml", netns)
 	if err != nil {
 		mgr.endpoints.Delete(container) // Clear our marker
 		return EndpointInfo{}, err
 	}
-	mgr.endpoints.Store(container, ctrl) // Replace marker with real ctrl
 
 	// Store to FS so that it will come back up after we restart (due to upgrade, crash, etc.)
 	// We intentionally do this AFTER Nebula successfully starts
 	// because if it failed, we'd return failure to netavark and the container creation would fail, too
 	if err := mgr.db.Add(container, netns); err != nil {
-		ctrl.Stop() // It already started, ensure it stops (async) to avoid leaking resources
+		endpoint.stop() // It already started, ensure it stops (async) to avoid leaking resources
 		mgr.endpoints.Delete(container)
 		return EndpointInfo{}, err
 	}
 
-	device := ctrl.Device()
+	mgr.endpoints.Store(container, endpoint) // Replace marker with real endpoint
+	// Config may have changed after we loaded it, but before reload could see this endpoint
+	endpoint.reloadIfChanged(mgr.tunnels.logger)
+	device := endpoint.ctrl.Device()
 	return EndpointInfo{
 		InterfaceName: device.Name(),
 		Addresses:     append([]netip.Prefix(nil), device.Networks()...),
@@ -96,22 +114,51 @@ func (mgr *Manager) Up(container string, netns string) (EndpointInfo, error) {
 
 // Takes an endpoint down for given container, if it was up
 func (mgr *Manager) Down(container string) error {
-	if err := mgr.db.Remove(container); err != nil {
-		// TODO is it ever good idea to deny endpoint deletion?
+	// Exclude starts and shutdown while stopping
+	mgr.lifecycle.Lock()
+	defer mgr.lifecycle.Unlock()
+	if err := validateContainerId(container); err != nil {
 		return err
 	}
-
 	val, ok := mgr.endpoints.Load(container)
-	if !ok {
-		return nil // Not up, so it is already down. Hopefully.
-	}
 	if val == "marker" {
 		return fmt.Errorf("Down called for %s while Up is in flight", container)
 	}
-	deleted := mgr.endpoints.CompareAndDelete(container, val)
-	if deleted {
-		val.(*nebula.Control).Stop()
-	} // else: racing Down calls, probably
-
+	if err := mgr.db.Remove(container); err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	endpoint := val.(*runningEndpoint)
+	endpoint.stop()
+	mgr.endpoints.Delete(container)
 	return nil
+}
+
+// Close stops config watching and live endpoints but keeps restart recovery records.
+func (mgr *Manager) Close() {
+	mgr.lifecycle.Lock()
+	defer mgr.lifecycle.Unlock()
+	if mgr.closed {
+		return
+	}
+	mgr.closed = true
+	close(mgr.stopWatch)
+	<-mgr.watchDone
+	mgr.endpoints.Range(func(key, value any) bool {
+		value.(*runningEndpoint).stop()
+		mgr.endpoints.Delete(key)
+		return true
+	})
+}
+
+// Reloads configs of all endpoints whose config files have changed
+func (mgr *Manager) reload() {
+	mgr.endpoints.Range(func(key, value any) bool {
+		if endpoint, ok := value.(*runningEndpoint); ok { // Skip markers
+			endpoint.reloadIfChanged(mgr.tunnels.logger)
+		}
+		return true
+	})
 }

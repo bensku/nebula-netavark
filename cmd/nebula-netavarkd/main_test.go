@@ -52,6 +52,7 @@ func TestHandleMessageWithoutTunnels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer manager.Close()
 	for _, tc := range []struct {
 		name string
 		msg  proto.PluginMessage

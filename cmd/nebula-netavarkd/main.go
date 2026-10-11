@@ -50,13 +50,8 @@ func main() {
 	defer stop()
 
 	// Ignore SIGHUP so it doesn't terminate us (default Go behavior)
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	go func() {
-		for range hup {
-			// Do nothing
-		}
-	}()
+	// Config changes are picked up automatically, so there is nothing to reload
+	signal.Ignore(syscall.SIGHUP)
 
 	var lc net.ListenConfig
 	lis, err := lc.Listen(ctx, "unix", *socketPath)
@@ -74,6 +69,8 @@ func main() {
 		slog.Error("failed to start netmgr", "error", err)
 		os.Exit(1)
 	}
+
+	defer netmgr.Close()
 
 	// Tell systemd we're ready to serve connections
 	notifyReady()

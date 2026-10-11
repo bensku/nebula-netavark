@@ -184,25 +184,15 @@ chmod 700 "$work/plugins/nebula-netavark-plugin"
 log "Generating IPv6 certificates (artifacts: $work)"
 nebula-cert ca -name "$network" -version 2 -duration 1h \
     -out-crt "$work/certs/ca.crt" -out-key "$work/certs/ca.key"
-write_endpoint() {
-    local name=$1 address=$2 peer=$3 port=$4 peer_port=$5
-    nebula-cert sign -name "$name" -version 2 -networks "$address/64" -duration 30m \
-        -ca-crt "$work/certs/ca.crt" -ca-key "$work/certs/ca.key" \
-        -out-crt "$work/certs/$name.crt" -out-key "$work/certs/$name.key"
-    cat >"$work/config/$name.yml" <<EOF
+cat >"$work/config/network.yml" <<EOF
 pki:
   ca: "$work/certs/ca.crt"
-  cert: "$work/certs/$name.crt"
-  key: "$work/certs/$name.key"
   initiating_version: 2
-static_host_map:
-  "$peer": ["[::1]:$peer_port"]
 lighthouse:
   am_lighthouse: false
   hosts: []
 listen:
   host: "::1"
-  port: $port
 tun:
   dev: nebula-test
 firewall:
@@ -210,6 +200,21 @@ firewall:
     - {port: any, proto: any, host: any}
   outbound:
     - {port: any, proto: any, host: any}
+EOF
+write_endpoint() {
+    local name=$1 address=$2 peer=$3 port=$4 peer_port=$5
+    nebula-cert sign -name "$name" -version 2 -networks "$address/64" -duration 30m \
+        -ca-crt "$work/certs/ca.crt" -ca-key "$work/certs/ca.key" \
+        -out-crt "$work/certs/$name.crt" -out-key "$work/certs/$name.key"
+    cat >"$work/config/$name.yml" <<EOF
+import: network.yml
+pki:
+  cert: "$work/certs/$name.crt"
+  key: "$work/certs/$name.key"
+static_host_map:
+  "$peer": ["[::1]:$peer_port"]
+listen:
+  port: $port
 EOF
 }
 write_endpoint "$name_a" "$addr_a" "$addr_b" "$port_base" "$((port_base + 1))"
